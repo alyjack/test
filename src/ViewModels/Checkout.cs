@@ -1,0 +1,100 @@
+﻿using System.Threading.Tasks;
+
+namespace SourceGit.ViewModels
+{
+    public class Checkout : Popup
+    {
+        public string Branch
+        {
+            get;
+        }
+
+        public bool DiscardLocalChanges
+        {
+            get;
+            set;
+        }
+
+        public Checkout(Repository repo, string branch)
+        {
+            _repo = repo;
+            Branch = branch;
+            DiscardLocalChanges = false;
+        }
+
+        public override bool CanStartDirectly()
+        {
+            return _repo.LocalChangesCount == 0;
+        }
+
+        public override async Task<bool> Sure()
+        {
+            using var lockWatcher = _repo.LockWatcher();
+            ProgressDescription = $"Checkout '{Branch}' ...";
+
+            var log = _repo.CreateLog($"Checkout '{Branch}'");
+            Use(log);
+
+            if (_repo.CurrentBranch is { IsDetachedHead: true })
+            {
+                var refs = await new Commands.QueryRefsContainsCommit(_repo.FullPath, _repo.CurrentBranch.Head).GetResultAsync();
+                if (refs.Count == 0)
+                {
+                    var msg = App.Text("Checkout.WarnLostCommits");
+                    var shouldContinue = await App.AskConfirmAsync(msg);
+                    if (!shouldContinue)
+                        return true;
+                }
+            }
+
+            var succ = false;
+            var needPopStash = false;
+
+            if (!DiscardLocalChanges)
+            {
+                var changes = await new Commands.CountLocalChanges(_repo.FullPath, false).GetResultAsync();
+                if (changes > 0)
+                {
+                    succ = await new Commands.Stash(_repo.FullPath)
+                        .Use(log)
+                        .PushAsync("CHECKOUT_AUTO_STASH", false);
+                    if (!succ)
+                    {
+                        log.Complete();
+                        return false;
+                    }
+
+                    needPopStash = true;
+                }
+            }
+
+            succ = await new Commands.Checkout(_repo.FullPath)
+                .Use(log)
+                .BranchAsync(Branch, DiscardLocalChanges);
+
+            if (succ)
+            {
+                await _repo.AutoUpdateSubmodulesAsync(log);
+
+                if (needPopStash)
+                    await new Commands.Stash(_repo.FullPath)
+                        .Use(log)
+                        .PopAsync("stash@{0}");
+            }
+
+            log.Complete();
+
+            var b = _repo.Branches.Find(x => x.IsLocal && x.Name == Branch);
+            if (b != null && _repo.HistoryFilterMode == Models.FilterMode.Included)
+                _repo.SetBranchFilterMode(b, Models.FilterMode.Included, false, false);
+
+            _repo.MarkBranchesDirtyManually();
+
+            ProgressDescription = "Waiting for branch updated...";
+            await Task.Delay(400);
+            return succ;
+        }
+
+        private readonly Repository _repo = null;
+    }
+}
